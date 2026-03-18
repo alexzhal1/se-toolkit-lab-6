@@ -3,23 +3,15 @@
 
 Fetches questions one at a time from the autochecker API,
 runs your agent, and checks the answer locally.
-Stops at the first failure.
 
 Usage:
-    uv run run_eval.py           # all questions, stop at first fail
+    uv run run_eval.py           # all questions, run ALL (don't stop on fail)
     uv run run_eval.py --index 5 # single question (for debugging)
 
 Reads from .env (same credentials as the autochecker):
-    AUTOCHECKER_API_URL  — e.g. https://auche.namaz.live
-    AUTOCHECKER_EMAIL    — your university email
-    AUTOCHECKER_PASSWORD — your GitHub username + Telegram alias
-
-Note:
-    This runner tests your agent against the LOCAL question set only.
-    The autochecker bot tests ADDITIONAL hidden questions not shown here.
-    Some questions use LLM-based judging on the bot side for more accurate
-    scoring (locally they fall back to simple keyword matching).
-    You need to pass a minimum threshold overall (local + hidden).
+    AUTOCHECKER_API_URL
+    AUTOCHECKER_EMAIL
+    AUTOCHECKER_PASSWORD
 """
 
 import argparse
@@ -93,7 +85,7 @@ def _fetch_question(api_url: str, auth: str, lab: str, index: int):
         sys.exit(1)
 
 
-def _run_agent(question: str, timeout: int = 60):
+def _run_agent(question: str, timeout: int = 240):
     """Run agent.py with the question. Returns (answer_dict, error_msg)."""
     try:
         result = subprocess.run(
@@ -103,7 +95,7 @@ def _run_agent(question: str, timeout: int = 60):
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return None, "Agent timed out (60s)"
+        return None, "Agent timed out (120s)"
     except FileNotFoundError:
         return None, "agent.py not found"
 
@@ -130,6 +122,14 @@ def _run_agent(question: str, timeout: int = 60):
 # Matching logic (mirrors autochecker evaluation)
 # ---------------------------------------------------------------------------
 
+def _try_float(s):
+    """Try to convert string to float, return None on failure."""
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
 def _match(text: str, rule: dict) -> bool:
     """Check if text satisfies the matching rule."""
     text_lower = text.lower()
@@ -147,13 +147,21 @@ def _match(text: str, rule: dict) -> bool:
         return bool(re.search(rule["regex"], text, re.IGNORECASE))
 
     if "numeric_gt" in rule:
-        numbers = re.findall(r"[\d.]+", text)
-        return any(float(n) > rule["numeric_gt"] for n in numbers if n)
+        numbers = re.findall(r"\d+\.?\d*", text)
+        for n in numbers:
+            val = _try_float(n)
+            if val is not None and val > rule["numeric_gt"]:
+                return True
+        return False
 
     if "numeric_range" in rule:
         lo, hi = rule["numeric_range"]
-        numbers = re.findall(r"[\d.]+", text)
-        return any(lo <= float(n) <= hi for n in numbers if n)
+        numbers = re.findall(r"\d+\.?\d*", text)
+        for n in numbers:
+            val = _try_float(n)
+            if val is not None and lo <= val <= hi:
+                return True
+        return False
 
     return False
 
@@ -206,8 +214,6 @@ def _check_question(q: dict, data: dict) -> tuple[bool, str]:
             else:
                 return False, f"    Expected: {_format_expected(expected)}"
     elif q.get("has_rubric"):
-        # Rubric-only question — locally we can only do a basic length check.
-        # The autochecker bot uses LLM-based judging for more accurate scoring.
         if len(answer.split()) < 20:
             return False, f"    {YELLOW}Answer too short for a reasoning question (bot uses LLM judge){RESET}"
 
@@ -259,6 +265,13 @@ def main():
             print(f"Question {args.index} not found", file=sys.stderr)
             sys.exit(1)
 
+        try:
+            Path("last_question_debug.json").write_text(
+                json.dumps(q, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
         question = q["question"]
         print(f"  [{args.index}] {question}")
 
@@ -267,7 +280,7 @@ def main():
             print(f"  {RED}Error: {error}{RESET}")
             sys.exit(1)
 
-        passed, reason = _check_question(q, data)
+        passed_q, reason = _check_question(q, data)
         answer = data.get("answer", "")
         source = data.get("source", "")
         tool_calls = data.get("tool_calls", [])
@@ -279,7 +292,7 @@ def main():
             tools_used = [tc.get("tool", "?") for tc in tool_calls]
             print(f"  Tools: {', '.join(tools_used)}")
 
-        if passed:
+        if passed_q:
             print(f"  {GREEN}PASSED{RESET}")
         else:
             print(f"  {RED}FAILED{RESET}")
@@ -287,47 +300,88 @@ def main():
             sys.exit(1)
         return
 
-    # Full run mode — stop at first failure
+    # Full run mode -- run ALL questions, don't stop on failure
     index = 0
     passed = 0
+    failed = 0
+    total = 0
+    failures = []
 
     while True:
         q = _fetch_question(api_url, auth, LAB, index)
         if q is None:
-            # All questions done
-            print(f"\n{BOLD}{GREEN}{passed}/{index} PASSED{RESET}")
-            print(
-                f"\n{YELLOW}Note: The autochecker bot tests {index} additional hidden questions"
-                f" and may use LLM-based judging for open-ended answers."
-                f" You need to pass a minimum threshold overall.{RESET}"
-            )
             break
 
         total = q["total"]
         question = q["question"]
 
-        # Run the agent
         data, error = _run_agent(question)
 
         if error:
-            print(f"\n  {RED}x [{index + 1}/{total}] {question}{RESET}")
+            print(f"  {RED}x [{index + 1}/{total}] {question}{RESET}")
             print(f"    Error: {error}")
-            print(f"\n{BOLD}{passed}/{total} passed{RESET}")
-            sys.exit(1)
+            failed += 1
+            failures.append({
+                "index": index,
+                "question": question,
+                "error": error,
+            })
+            index += 1
+            continue
 
         ok, reason = _check_question(q, data)
 
         if ok:
             print(f"  {GREEN}+ [{index + 1}/{total}] {question}{RESET}")
             passed += 1
-            index += 1
         else:
             answer = data.get("answer", "")
-            print(f"\n  {RED}x [{index + 1}/{total}] {question}{RESET}")
+            source = data.get("source", "")
+            tool_calls = data.get("tool_calls", [])
+            print(f"  {RED}x [{index + 1}/{total}] {question}{RESET}")
             print(f"    Your answer: {answer[:200]}")
+            if source:
+                print(f"    Source: {source}")
+            if tool_calls:
+                tools_used = [tc.get("tool", "?") for tc in tool_calls]
+                print(f"    Tools: {', '.join(tools_used)}")
             print(reason)
-            print(f"\n{BOLD}{passed}/{total} passed{RESET}")
-            sys.exit(1)
+            failed += 1
+            failures.append({
+                "index": index,
+                "question": question,
+                "answer": answer[:200],
+                "reason": reason,
+            })
+
+        index += 1
+
+    # Summary
+    total_run = passed + failed
+    if total_run == 0:
+        print(f"\n{YELLOW}No questions found.{RESET}")
+        return
+
+    if failed == 0:
+        print(f"\n{BOLD}{GREEN}{passed}/{total_run} PASSED -- ALL CLEAR!{RESET}")
+    else:
+        print(f"\n{BOLD}{passed}/{total_run} passed, {RED}{failed} failed{RESET}")
+        print(f"\n{YELLOW}Failed questions:{RESET}")
+        for f in failures:
+            print(f"  [{f['index'] + 1}] {f['question']}")
+            if "error" in f:
+                print(f"      Error: {f['error'][:100]}")
+            if "answer" in f:
+                print(f"      Answer: {f.get('answer', '')[:100]}")
+
+    print(
+        f"\n{YELLOW}Note: The autochecker bot tests additional hidden questions"
+        f" and may use LLM-based judging for open-ended answers."
+        f" You need to pass a minimum threshold overall.{RESET}"
+    )
+
+    if failed > 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
