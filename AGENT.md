@@ -1,20 +1,45 @@
 # Agent Documentation
 
 ## Overview
-`agent.py` is a simple command-line interface that forwards a user question to a Large Language Model (LLM) and returns a structured JSON response. It serves as the foundation for a more advanced agent that will include tool calling and an agentic loop in later tasks.
+`agent.py` is a CLI tool that answers questions about the project by reading the wiki. It implements an **agentic loop** with two tools: `read_file` and `list_files`. The agent decides when to use tools, executes them, and finally returns a structured JSON answer with the source reference.
 
 ## Architecture
-- The agent reads configuration from a `.env.agent.secret` file (not committed to version control).
-- It uses the OpenAI Python library to communicate with any OpenAI‑compatible API (here, OpenRouter).
-- The agent prints **only** a valid JSON object to stdout; all other output (debug, errors) goes to stderr.
-- On success, it exits with code 0; on failure, it exits with a non‑zero code.
+- The agent uses the OpenAI-compatible API (OpenRouter) with function calling.
+- It loads configuration from `.env.agent.secret`.
+- The agentic loop:
+  1. Send conversation history (system prompt + user query + previous tool results) and tool definitions to the LLM.
+  2. If the LLM requests tool calls, execute them, append results as `tool` messages, and repeat.
+  3. If the LLM returns a text message (no tool calls), that is the final answer.
+- Maximum 10 tool calls per question to prevent infinite loops.
 
-## LLM Provider
-- **Provider**: OpenRouter (free tier)
-- **Model**: `arcee-ai/trinity-large-preview:free`
-- **API Base**: `https://openrouter.ai/api/v1`
+## Tools
 
-The free model has a rate limit of 50 requests per day per account, which is sufficient for development and testing with the provided evaluation script (if run one question at a time).
+### `read_file`
+- **Description**: Reads a file from the project repository.
+- **Parameter**: `path` (string) – relative path from project root (e.g., `wiki/git-workflow.md`).
+- **Returns**: File contents or an error message.
+- **Security**: Prevents directory traversal – any path that resolves outside the project root is rejected.
 
-## Configuration
-Create a `.env.agent.secret` file in the project root with the following variables:
+### `list_files`
+- **Description**: Lists files and directories at a given path.
+- **Parameter**: `path` (string) – relative directory path from project root (e.g., `wiki`).
+- **Returns**: Newline-separated list of entries, or an error.
+- **Security**: Same path traversal protection.
+
+## System Prompt
+The system prompt instructs the agent:
+- To explore the wiki using `list_files` and `read_file`.
+- To include the source (file path and optional anchor) in the final answer.
+- To stop making tool calls once the answer is ready.
+
+## Output Format
+The agent prints a single JSON object to stdout:
+```json
+{
+  "answer": "The answer text...",
+  "source": "wiki/git-workflow.md#resolving-merge-conflicts",
+  "tool_calls": [
+    {"tool": "list_files", "args": {"path": "wiki"}, "result": "git-workflow.md\n..."},
+    {"tool": "read_file", "args": {"path": "wiki/git-workflow.md"}, "result": "..."}
+  ]
+}

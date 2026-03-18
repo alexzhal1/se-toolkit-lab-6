@@ -1,34 +1,44 @@
-# Task 2: The Documentation Agent – Implementation Plan
+# Task 2 Implementation Plan: The Documentation Agent
 
 ## Overview
-This task extends the basic agent from Task 1 by adding two file‑system tools and an agentic loop. The agent will answer questions about the project wiki by reading files and listing directories.
+Extend `agent.py` from Task 1 with an agentic loop that can call tools (`read_file`, `list_files`) to navigate the project wiki and answer questions. The agent will:
+1. Send the user query plus tool definitions to the LLM.
+2. If the LLM responds with tool calls, execute them and feed results back.
+3. Repeat until the LLM returns a final answer (no tool calls) or a maximum of 10 iterations.
+4. Output JSON with `answer`, `source`, and `tool_calls` (full history).
 
-## Tools
-- **`read_file(path)`** – returns the content of a file relative to the project root.
-- **`list_files(path)`** – returns a newline‑separated list of entries in a directory.
+## Tool Schemas (OpenAI Function Calling)
+- `read_file`: reads a file given a relative path. Parameters: `path` (string).
+- `list_files`: lists contents of a directory. Parameters: `path` (string).
 
-Both tools must prevent directory traversal attacks (no access outside the project root).
+Both tools must enforce security: prevent path traversal outside the project root.
 
-## Agentic Loop
-1. Send the user question plus tool definitions to the LLM.
-2. If the LLM responds with `tool_calls`:
-   - Execute each tool, record the result.
-   - Append the results as `tool` messages.
-   - Repeat (up to 10 iterations).
-3. If the LLM responds with a text message (no tool calls), treat it as the final answer.
-4. Extract the source reference (the LLM is instructed to include it, e.g., `source: wiki/git-workflow.md#resolving-merge-conflicts`).
-5. Output JSON with `answer`, `source`, and `tool_calls` (array of all calls made).
+## Agentic Loop Implementation
+- Use the OpenAI client with the `tools` parameter.
+- Maintain a conversation history: system prompt, user query, and all assistant/tool messages.
+- Loop:
+  - Send history + tools to LLM.
+  - Extract response: if `tool_calls` present, execute each, append tool response messages, continue.
+  - If no tool calls, take the assistant message as final answer and break.
+- After loop, extract `source` from the final answer (the LLM should include it in the text; we may parse or trust that it's there). The spec requires `source` as a separate field – we will attempt to extract it from the final message or default to an empty string.
+- Collect all tool calls made into the `tool_calls` output array.
 
-## System Prompt
-The system prompt instructs the LLM to:
-- Use `list_files` to explore the `wiki/` directory.
-- Use `read_file` to read specific files.
-- Include the source reference in the final answer.
+## System Prompt Strategy
+The system prompt instructs the LLM:
+- It is a documentation agent with access to a wiki.
+- Use `list_files` to explore available wiki files.
+- Use `read_file` to read file contents.
+- When answering, include the source file (and optional anchor) in the answer text (e.g., "See wiki/file.md#section").
+- Respond in the final message without tool calls.
 
 ## Security
-Paths are normalized using `Path.resolve()` and checked against the project root. Any attempt to escape (e.g., using `..`) is rejected with an error message.
+- Resolve paths relative to the project root (current working directory).
+- Use `os.path.abspath` and ensure the resolved path starts with the project root to prevent `../` escapes.
 
 ## Testing
-Two regression tests will be added:
-- `"How do you resolve a merge conflict?"` – expects a `read_file` call and `git-workflow.md` in the source.
-- `"What files are in the wiki?"` – expects a `list_files` call with a path containing `wiki`.
+Add two regression tests:
+1. Question: "How do you resolve a merge conflict?" – Expect `read_file` tool call on `wiki/git-workflow.md` and source containing that file.
+2. Question: "What files are in the wiki?" – Expect `list_files` tool call on `wiki` and source referencing that listing.
+
+## Dependencies
+- No new dependencies beyond Task 1 (`openai`, `python-dotenv`).
